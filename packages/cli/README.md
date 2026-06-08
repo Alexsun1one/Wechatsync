@@ -13,6 +13,9 @@ npm install -g @wechatsync/cli
 ```bash
 # 同步文章到知乎和掘金
 wechatsync sync article.md --platforms zhihu,juejin
+
+# Sun 常用发布矩阵：公众号、知乎、小红书、X、今日头条
+wechatsync sync article.md --preset sun
 ```
 
 首次使用会提示安装 Chrome 扩展 - 访问 https://wechatsync.com/#install 安装。
@@ -25,6 +28,12 @@ wechatsync sync article.md --platforms zhihu,juejin
 # 基本用法
 wechatsync sync article.md -p zhihu,juejin
 
+# 使用平台预设
+wechatsync sync article.md --preset sun
+wechatsync sync article.md --preset longform
+wechatsync sync article.md --preset social
+wechatsync sync article.md --preset tech
+
 # 指定标题
 wechatsync sync article.md -t "我的文章" -p zhihu
 
@@ -34,6 +43,21 @@ wechatsync sync article.md -p juejin --cover https://example.com/cover.jpg
 # 预览（不实际同步）
 wechatsync sync article.md --dry-run
 ```
+
+### presets - 查看平台预设
+
+```bash
+wechatsync presets
+```
+
+内置预设：
+
+| 预设 | 平台 |
+|------|------|
+| `sun` | `weixin`, `zhihu`, `xiaohongshu`, `x`, `toutiao` |
+| `longform` | `weixin`, `zhihu`, `toutiao` |
+| `social` | `xiaohongshu`, `x`, `weibo` |
+| `tech` | `weixin`, `zhihu`, `juejin`, `csdn` |
 
 ### platforms - 查看平台
 
@@ -89,7 +113,9 @@ CLI 启动后监听 WebSocket 端口，等待 Chrome 扩展连接。
 
 ## 支持的平台
 
-知乎、掘金、简书、头条、微博、B站、百家号、CSDN、语雀、豆瓣、搜狐、雪球、微信公众号、人人都是产品经理、大鱼号、一点资讯、51CTO、搜狐焦点、慕课网、开源中国、思否、博客园
+知乎、掘金、简书、头条、微博、B站、百家号、CSDN、语雀、豆瓣、搜狐、雪球、微信公众号、小红书、X、人人都是产品经理、大鱼号、一点资讯、51CTO、搜狐焦点、慕课网、开源中国、思否、博客园。
+
+> 注意：部分平台适配器随 Chrome 扩展 Release 或私有适配器包分发；从公开源码仓库 shallow clone 时可能只看到公开平台代码。实际可用平台以 `wechatsync platforms --auth` 返回为准。
 
 ## 环境变量
 

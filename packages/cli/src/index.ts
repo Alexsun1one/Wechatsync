@@ -27,6 +27,36 @@ const GITHUB_URL = 'https://github.com/wechatsync/Wechatsync'
 
 const program = new Command()
 
+const PLATFORM_PRESETS: Record<string, string[]> = {
+  sun: ['weixin', 'zhihu', 'xiaohongshu', 'x', 'toutiao'],
+  longform: ['weixin', 'zhihu', 'toutiao'],
+  social: ['xiaohongshu', 'x', 'weibo'],
+  tech: ['weixin', 'zhihu', 'juejin', 'csdn'],
+}
+
+function formatPresetList(): string {
+  return Object.entries(PLATFORM_PRESETS)
+    .map(([name, platforms]) => `${name}=${platforms.join(',')}`)
+    .join(' | ')
+}
+
+function resolvePlatforms(options: { platforms?: string; preset?: string }): string[] {
+  if (options.preset) {
+    const preset = PLATFORM_PRESETS[options.preset]
+    if (!preset) {
+      console.error(chalk.red(`未知平台预设: ${options.preset}`))
+      console.log(chalk.gray(`可用预设: ${formatPresetList()}`))
+      process.exit(1)
+    }
+    return preset
+  }
+
+  return (options.platforms || 'zhihu,juejin')
+    .split(',')
+    .map((p: string) => p.trim().toLowerCase())
+    .filter(Boolean)
+}
+
 // 默认超时时间
 let connectionTimeout = 30000
 
@@ -630,6 +660,7 @@ program
   .command('sync <file>')
   .description('同步 Markdown/HTML 文件到平台（HTML 文件可保留自定义排版样式）')
   .option('-p, --platforms <platforms>', '目标平台，逗号分隔', 'zhihu,juejin')
+  .option('--preset <preset>', `平台预设：${formatPresetList()}`)
   .option('-t, --title <title>', '文章标题（默认从文件提取）')
   .option('--cover <url>', '封面图 URL 或本地路径')
   .option('--dry-run', '仅显示将要执行的操作，不实际同步')
@@ -675,7 +706,7 @@ program
       }
     }
 
-    const platforms = options.platforms.split(',').map((p: string) => p.trim().toLowerCase())
+    const platforms = resolvePlatforms(options)
 
     // 准备内容
     const markdown = parsed.format === 'markdown' ? parsed.content : undefined
@@ -687,6 +718,9 @@ program
     console.log(`  标题: ${chalk.cyan(title)}`)
     console.log(`  格式: ${chalk.cyan(parsed.format)}${parsed.format === 'html' ? chalk.green(' (保留原始排版)') : ''}`)
     console.log(`  平台: ${chalk.cyan(platforms.join(', '))}`)
+    if (options.preset) {
+      console.log(`  预设: ${chalk.cyan(options.preset)}`)
+    }
     console.log(`  内容: ${chalk.gray(parsed.content.length + ' 字符')}`)
     if (cover) {
       console.log(`  封面: ${chalk.cyan(cover.startsWith('data:') ? '(本地图片)' : cover)}`)
@@ -789,6 +823,22 @@ program
       bridge.stop()
       process.exit(0)
     }
+  })
+
+// ============ presets 命令 ============
+
+program
+  .command('presets')
+  .description('列出内置平台预设')
+  .action(() => {
+    console.log()
+    console.log(chalk.bold('平台预设:'))
+    console.log()
+    for (const [name, platforms] of Object.entries(PLATFORM_PRESETS)) {
+      console.log(`  ${chalk.cyan(name.padEnd(8))} ${platforms.join(', ')}`)
+    }
+    console.log()
+    console.log(chalk.gray('示例: wechatsync sync article.md --preset sun'))
   })
 
 // ============ platforms 命令 ============
@@ -977,6 +1027,8 @@ if (process.argv.length <= 2) {
   console.log()
   console.log(chalk.bold('快速开始:'))
   console.log(`  ${chalk.cyan('wechatsync sync article.md')}        同步 Markdown 文件`)
+  console.log(`  ${chalk.cyan('wechatsync sync article.md --preset sun')}  同步到 Sun 常用平台`)
+  console.log(`  ${chalk.cyan('wechatsync presets')}         查看平台预设`)
   console.log(`  ${chalk.cyan('wechatsync sync article.html')}      同步 HTML 文件 (保留自定义排版)`)
   console.log(`  ${chalk.cyan('wechatsync extract -o out.md')}      从浏览器提取文章`)
   console.log()
