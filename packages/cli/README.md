@@ -19,6 +19,10 @@ wechatsync sync article.md --preset sun
 
 # 更稳的 draft-first 工作流：先生成各平台草稿包，不连接扩展、不点发布
 wechatsync draft article.md --preset sun
+
+# 用隔离 Chrome profile 跑 DOM 草稿填充（以小红书为例）
+wechatsync chrome-cdp start --open https://creator.xiaohongshu.com
+wechatsync draft-run drafts/my-article/manifest.json --platform xiaohongshu
 ```
 
 首次使用会提示安装 Chrome 扩展 - 访问 https://wechatsync.com/#install 安装。
@@ -79,19 +83,60 @@ wechatsync draft article.md --preset sun --xhs-images ./xhs-images.txt
 | `platforms/xiaohongshu/upload-files.txt` | 小红书待上传图片绝对路径列表 |
 | `automation/xhs-dom-upload.playwright.mjs` | 小红书 DOM/file-input 上传脚本；停在最终发布前 |
 
-小红书自动化脚本要求已登录 Chrome 暴露调试端口，例如：
+推荐用 CLI 管理一个隔离的 CDP Chrome profile：
 
 ```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/.wechatsync-chrome"
+# 第一次会打开一个独立 Chrome；在这里登录小红书一次，后续复用这个 profile
+wechatsync chrome-cdp start --open https://creator.xiaohongshu.com
 
-CHROME_CDP_URL=http://127.0.0.1:9222 \
-  node drafts/my-article/automation/xhs-dom-upload.playwright.mjs \
-  drafts/my-article/manifest.json
+# 检查 CDP 是否可用
+wechatsync chrome-cdp check
+
+# 读取 manifest 并填入小红书草稿；不点击最终发布
+wechatsync draft-run drafts/my-article/manifest.json --platform xiaohongshu
+```
+
+如果你已经自己启动了带 remote-debugging-port 的 Chrome，也可以显式指定：
+
+```bash
+wechatsync draft-run drafts/my-article/manifest.json \
+  --platform xiaohongshu \
+  --cdp-url http://127.0.0.1:9222
 ```
 
 这条路径使用 DOM selector 和 `input[type=file]`，不是屏幕坐标点击。默认 `publishPolicy` 是 `manual-final-click`，即只填草稿，不做最终发布。
+
+### chrome-cdp - 启动或检查 CDP Chrome
+
+```bash
+# 检查默认 http://127.0.0.1:9222 是否可用
+wechatsync chrome-cdp check
+
+# 启动隔离 profile，避免污染你日常 Chrome
+wechatsync chrome-cdp start --open https://creator.xiaohongshu.com
+
+# 指定端口、profile 或 Chrome 路径
+wechatsync chrome-cdp start \
+  --port 9333 \
+  --user-data-dir ~/.wechatsync-chrome \
+  --chrome-path "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+# CI/smoke 可用无头模式
+wechatsync chrome-cdp start --headless --port 9333 --user-data-dir /tmp/wechatsync-chrome-smoke
+```
+
+### draft-run - 自动填平台草稿
+
+```bash
+# 小红书：上传 manifest 中的图片，填标题和正文，停在最终发布前
+wechatsync draft-run drafts/my-article/manifest.json --platform xiaohongshu
+
+# 如果 CDP 不可用，自动启动隔离 Chrome
+wechatsync draft-run drafts/my-article/manifest.json --platform xiaohongshu --start-chrome
+
+# 只检查 manifest、CDP、适配器脚本，不填网页
+wechatsync draft-run drafts/my-article/manifest.json --platform xiaohongshu --dry-run
+```
 
 ### presets - 查看平台预设
 
@@ -172,6 +217,8 @@ CLI 启动后监听 WebSocket 端口，等待 Chrome 扩展连接。
 |------|------|--------|
 | `SYNC_WS_PORT` | WebSocket 端口 | 9527 |
 | `WECHATSYNC_TOKEN` | 安全验证 token | - |
+| `CHROME_CDP_URL` | draft-run 使用的 Chrome CDP 地址 | `http://127.0.0.1:9222` |
+| `CHROME_PATH` | Chrome 可执行文件路径 | 自动探测 |
 
 ## 远程桥接
 

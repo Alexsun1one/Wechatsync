@@ -652,7 +652,8 @@ function createXhsPlaywrightScript(): string {
   return `#!/usr/bin/env node
 import fs from 'node:fs'
 import path from 'node:path'
-import { chromium } from 'playwright'
+
+const { chromium } = await import('playwright-core')
 
 const manifestPath = process.argv[2] || path.resolve('manifest.json')
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'))
@@ -669,7 +670,10 @@ await page.goto('https://creator.xiaohongshu.com/publish/publish?from=tab_switch
 })
 
 const imageInput = page.locator('input[type="file"]').first()
-await imageInput.setInputFiles(manifest.xhs.images)
+await imageInput.waitFor({ state: 'attached', timeout: 30000 })
+if (manifest.xhs.images.length > 0) {
+  await imageInput.setInputFiles(manifest.xhs.images)
+}
 
 await page.getByPlaceholder('填写标题会有更多赞哦').fill(manifest.xhs.title)
 
@@ -680,7 +684,7 @@ if (bodyCount === 0) throw new Error('Could not find Xiaohongshu body editor')
 await bodyTargets.nth(bodyCount - 1).fill(body)
 
 console.log('Xiaohongshu draft is filled. Final publish was not clicked.')
-await browser.close()
+await browser.disconnect()
 `
 }
 
@@ -799,11 +803,11 @@ ${files.map((file) => `- \`${file.path}\`${file.platform ? ` (${file.platform})`
 如果需要自动填入小红书，请先用已登录 Chrome 启动调试端口，然后执行：
 
 \`\`\`bash
-CHROME_CDP_URL=http://127.0.0.1:9222 npx playwright install chromium
-CHROME_CDP_URL=http://127.0.0.1:9222 node automation/xhs-dom-upload.playwright.mjs manifest.json
+wechatsync chrome-cdp start --open https://creator.xiaohongshu.com
+wechatsync draft-run manifest.json --platform xiaohongshu
 \`\`\`
 
-脚本只填图、标题、正文，默认不会点击最终发布。
+这条路径使用 DOM selector 和 \`input[type=file]\`，不是屏幕坐标点击。默认只填图、标题、正文，不会点击最终发布。
 `)
   files.push({ kind: 'metadata', path: relativeFrom(outDir, readmePath), note: '草稿包说明' })
 
@@ -824,6 +828,152 @@ CHROME_CDP_URL=http://127.0.0.1:9222 node automation/xhs-dom-upload.playwright.m
   writeJsonFile(manifestPath, manifest)
 
   return manifest
+}
+
+// ============ Chrome CDP / draft runner ============
+
+interface ChromeCdpOptions {
+  port?: string
+  cdpUrl?: string
+  userDataDir?: string
+  chromePath?: string
+  waitMs?: string
+  open?: string
+  headless?: boolean
+}
+
+function getCdpUrl(options: ChromeCdpOptions): string {
+  return options.cdpUrl || process.env.CHROME_CDP_URL || `http://127.0.0.1:${options.port || '9222'}`
+}
+
+function getCdpPort(options: ChromeCdpOptions): number {
+  try {
+    return Number(new URL(getCdpUrl(options)).port || '9222')
+  } catch {
+    return Number(options.port || '9222')
+  }
+}
+
+async function isCdpAvailable(cdpUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${cdpUrl.replace(/\/$/, '')}/json/version`, {
+      signal: AbortSignal.timeout(2000),
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+async function waitForCdp(cdpUrl: string, waitMs: number): Promise<boolean> {
+  const deadline = Date.now() + waitMs
+  while (Date.now() < deadline) {
+    if (await isCdpAvailable(cdpUrl)) return true
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  return false
+}
+
+function resolveChromeExecutable(explicit?: string): string {
+  const candidates = [
+    explicit,
+    process.env.CHROME_PATH,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ].filter(Boolean) as string[]
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+
+  throw new Error('找不到 Chrome，请用 --chrome-path 或 CHROME_PATH 指定')
+}
+
+async function startChromeCdp(options: ChromeCdpOptions): Promise<string> {
+  const { spawn } = await import('child_process')
+  const cdpUrl = getCdpUrl(options)
+  if (await isCdpAvailable(cdpUrl)) {
+    return cdpUrl
+  }
+
+  const port = getCdpPort(options)
+  const chromePath = resolveChromeExecutable(options.chromePath)
+  const userDataDir = path.resolve(options.userDataDir || path.join(process.env.HOME || process.cwd(), '.wechatsync-chrome'))
+  ensureDir(userDataDir)
+
+  const args = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ]
+  if (options.headless) {
+    args.push('--headless=new', '--disable-gpu')
+  }
+  args.push(options.open || 'about:blank')
+
+  const child = spawn(chromePath, args, {
+    detached: true,
+    stdio: 'ignore',
+  })
+  child.unref()
+
+  const waitMs = Number(options.waitMs || '15000')
+  if (!(await waitForCdp(cdpUrl, waitMs))) {
+    throw new Error(`Chrome 已启动，但 ${cdpUrl} 在 ${waitMs}ms 内不可用`)
+  }
+
+  return cdpUrl
+}
+
+function readDraftManifest(manifestPath: string): DraftManifest {
+  const resolved = path.resolve(manifestPath)
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`manifest 不存在: ${resolved}`)
+  }
+  const manifest = JSON.parse(fs.readFileSync(resolved, 'utf-8')) as DraftManifest
+  if (manifest.version !== 1 || !manifest.title || !Array.isArray(manifest.platforms)) {
+    throw new Error(`manifest 格式不正确: ${resolved}`)
+  }
+  return manifest
+}
+
+async function runXhsDraftAutomation(manifestPath: string, cdpUrl: string): Promise<void> {
+  const { chromium } = await import('playwright-core')
+  const manifest = readDraftManifest(manifestPath)
+  if (!manifest.xhs) throw new Error('manifest.xhs is missing')
+
+  const browser = await chromium.connectOverCDP(cdpUrl)
+  const context = browser.contexts()[0] || await browser.newContext()
+  let page = context.pages().find((p) => p.url().includes('creator.xiaohongshu.com'))
+  if (!page) page = await context.newPage()
+
+  await page.goto('https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image', {
+    waitUntil: 'domcontentloaded',
+  })
+
+  const imageInput = page.locator('input[type="file"]').first()
+  await imageInput.waitFor({ state: 'attached', timeout: 30000 })
+  if (manifest.xhs.images.length > 0) {
+    await imageInput.setInputFiles(manifest.xhs.images)
+  }
+
+  await page.getByPlaceholder('填写标题会有更多赞哦').fill(manifest.xhs.title)
+
+  const bodyPath = path.join(path.dirname(manifestPath), 'platforms/xiaohongshu/body.txt')
+  const body = fs.readFileSync(bodyPath, 'utf-8')
+  const bodyTargets = page.locator('textarea, [contenteditable="true"]')
+  const bodyCount = await bodyTargets.count()
+  if (bodyCount === 0) throw new Error('Could not find Xiaohongshu body editor')
+  await bodyTargets.nth(bodyCount - 1).fill(body)
+
+  await (browser as unknown as { disconnect: () => Promise<void> }).disconnect()
 }
 
 // ============ Bridge 连接 ============
@@ -1148,6 +1298,123 @@ program
       }
       console.log(chalk.gray(`  输出目录: ${path.dirname(manifestFile)}`))
       console.log()
+    } catch (error) {
+      console.error(chalk.red((error as Error).message))
+      process.exit(1)
+    }
+  })
+
+// ============ chrome-cdp 命令 ============
+
+program
+  .command('chrome-cdp [action]')
+  .description('启动或检查一个带 remote-debugging-port 的 Chrome（供 draft-run 使用）')
+  .option('--cdp-url <url>', 'Chrome DevTools Protocol 地址（默认 http://127.0.0.1:9222）')
+  .option('--port <port>', 'Chrome 调试端口', '9222')
+  .option('--user-data-dir <dir>', 'Chrome 独立用户数据目录（默认 ~/.wechatsync-chrome）')
+  .option('--chrome-path <path>', 'Chrome 可执行文件路径')
+  .option('--open <url>', '启动后打开的页面', 'about:blank')
+  .option('--headless', '无头启动 Chrome（主要用于 CI/smoke）')
+  .option('--wait-ms <ms>', '等待 CDP 可用的时间', '15000')
+  .action(async (action: string | undefined, options) => {
+    const nextAction = action || 'check'
+    const cdpUrl = getCdpUrl(options)
+
+    try {
+      if (nextAction === 'check') {
+        const available = await isCdpAvailable(cdpUrl)
+        console.log()
+        if (available) {
+          console.log(chalk.green(`✓ Chrome CDP 可用: ${cdpUrl}`))
+        } else {
+          console.log(chalk.red(`✗ Chrome CDP 不可用: ${cdpUrl}`))
+          console.log(chalk.gray(`  启动: wechatsync chrome-cdp start --port ${getCdpPort(options)}`))
+          process.exitCode = 1
+        }
+        console.log()
+        return
+      }
+
+      if (nextAction !== 'start') {
+        console.error(chalk.red(`未知 action: ${nextAction}`))
+        console.log(chalk.gray('可用 action: check, start'))
+        process.exit(1)
+      }
+
+      const startedUrl = await startChromeCdp(options)
+      console.log()
+      console.log(chalk.green(`✓ Chrome CDP 已就绪: ${startedUrl}`))
+      console.log(chalk.gray(`  export CHROME_CDP_URL=${startedUrl}`))
+      console.log()
+    } catch (error) {
+      console.error(chalk.red((error as Error).message))
+      process.exit(1)
+    }
+  })
+
+// ============ draft-run 命令 ============
+
+program
+  .command('draft-run <manifest>')
+  .description('消费 draft manifest，并用 DOM/file-input 自动填平台草稿（默认不点击最终发布）')
+  .option('-p, --platform <platform>', '要运行的平台适配器', 'xiaohongshu')
+  .option('--cdp-url <url>', 'Chrome DevTools Protocol 地址（默认 http://127.0.0.1:9222）')
+  .option('--port <port>', 'Chrome 调试端口', '9222')
+  .option('--start-chrome', '如果 CDP 不可用，则启动隔离 Chrome profile')
+  .option('--user-data-dir <dir>', 'Chrome 独立用户数据目录（默认 ~/.wechatsync-chrome）')
+  .option('--chrome-path <path>', 'Chrome 可执行文件路径')
+  .option('--headless', '无头启动 Chrome（主要用于 CI/smoke）')
+  .option('--wait-ms <ms>', '等待 CDP 可用的时间', '15000')
+  .option('--dry-run', '只检查 manifest、CDP 和适配器脚本，不真正填草稿')
+  .action(async (manifestArg: string, options) => {
+    try {
+      const manifestPath = path.resolve(manifestArg)
+      const manifest = readDraftManifest(manifestPath)
+      const manifestDir = path.dirname(manifestPath)
+      const platform = String(options.platform || 'xiaohongshu').toLowerCase()
+
+      if (platform !== 'xiaohongshu') {
+        throw new Error(`暂不支持 draft-run 平台: ${platform}`)
+      }
+      if (!manifest.xhs) {
+        throw new Error('manifest 中没有 xiaohongshu 草稿配置')
+      }
+
+      const scriptPath = path.resolve(manifestDir, manifest.xhs.automation)
+      if (!fs.existsSync(scriptPath)) {
+        throw new Error(`小红书自动化脚本不存在: ${scriptPath}`)
+      }
+
+      let cdpUrl = getCdpUrl(options)
+      if (options.startChrome) {
+        cdpUrl = await startChromeCdp({
+          ...options,
+          open: 'https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image',
+        })
+      }
+
+      const cdpReady = await isCdpAvailable(cdpUrl)
+      if (!cdpReady) {
+        throw new Error(`Chrome CDP 不可用: ${cdpUrl}。先运行 wechatsync chrome-cdp start，或加 --start-chrome`)
+      }
+
+      console.log()
+      console.log(chalk.bold('draft-run 检查:'))
+      console.log(`  标题: ${chalk.cyan(manifest.title)}`)
+      console.log(`  平台: ${chalk.cyan(platform)}`)
+      console.log(`  CDP: ${chalk.cyan(cdpUrl)}`)
+      console.log(`  图片: ${chalk.cyan(`${manifest.xhs.imageCount} 张`)}`)
+      console.log(`  正文: ${chalk.cyan(`${manifest.xhs.bodyChars}/1000 字`)}`)
+      console.log(`  策略: ${chalk.cyan(manifest.publishPolicy)}`)
+
+      if (options.dryRun) {
+        console.log(chalk.yellow('  dry-run: 未填入浏览器草稿'))
+        console.log()
+        return
+      }
+
+      await runXhsDraftAutomation(manifestPath, cdpUrl)
+      console.log(chalk.green('Xiaohongshu draft is filled. Final publish was not clicked.'))
     } catch (error) {
       console.error(chalk.red((error as Error).message))
       process.exit(1)
