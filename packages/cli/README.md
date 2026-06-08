@@ -16,6 +16,9 @@ wechatsync sync article.md --platforms zhihu,juejin
 
 # Sun 常用发布矩阵：公众号、知乎、小红书、X、今日头条
 wechatsync sync article.md --preset sun
+
+# 更稳的 draft-first 工作流：先生成各平台草稿包，不连接扩展、不点发布
+wechatsync draft article.md --preset sun
 ```
 
 首次使用会提示安装 Chrome 扩展 - 访问 https://wechatsync.com/#install 安装。
@@ -43,6 +46,52 @@ wechatsync sync article.md -p juejin --cover https://example.com/cover.jpg
 # 预览（不实际同步）
 wechatsync sync article.md --dry-run
 ```
+
+### draft - 生成 draft-first 发布包
+
+`draft` 是更适合高精度发布流水线的入口：它只做内容编译和素材准备，不依赖 Chrome Extension，不读取浏览器登录态，也不会点击最终发布。
+
+```bash
+# 生成 Sun 常用矩阵的发布草稿包
+wechatsync draft article.md --preset sun
+
+# 指定输出目录
+wechatsync draft article.md --preset sun -o ./drafts/my-article
+
+# 给小红书指定图文卡片（逗号分隔）
+wechatsync draft article.md --preset sun --xhs-images ./xhs-01.png,./xhs-02.png
+
+# 或给一个图片列表文件，每行一个路径
+wechatsync draft article.md --preset sun --xhs-images ./xhs-images.txt
+```
+
+输出目录包含：
+
+| 文件 | 用途 |
+|------|------|
+| `manifest.json` | 后续浏览器适配器消费的结构化发布清单 |
+| `platforms/weixin.html` | 公众号富文本 HTML，已尽量内联样式/本地图 |
+| `platforms/zhihu.md` | 知乎草稿 Markdown |
+| `platforms/toutiao.md` | 今日头条草稿 Markdown |
+| `platforms/x/post.txt` | X/Twitter 首条草稿 |
+| `platforms/xiaohongshu/title.txt` | 小红书标题，20 字以内 |
+| `platforms/xiaohongshu/body.txt` | 小红书正文，1000 字以内 |
+| `platforms/xiaohongshu/upload-files.txt` | 小红书待上传图片绝对路径列表 |
+| `automation/xhs-dom-upload.playwright.mjs` | 小红书 DOM/file-input 上传脚本；停在最终发布前 |
+
+小红书自动化脚本要求已登录 Chrome 暴露调试端口，例如：
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.wechatsync-chrome"
+
+CHROME_CDP_URL=http://127.0.0.1:9222 \
+  node drafts/my-article/automation/xhs-dom-upload.playwright.mjs \
+  drafts/my-article/manifest.json
+```
+
+这条路径使用 DOM selector 和 `input[type=file]`，不是屏幕坐标点击。默认 `publishPolicy` 是 `manual-final-click`，即只填草稿，不做最终发布。
 
 ### presets - 查看平台预设
 
