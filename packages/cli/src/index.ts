@@ -27,6 +27,36 @@ const GITHUB_URL = 'https://github.com/wechatsync/Wechatsync'
 
 const program = new Command()
 
+const PLATFORM_PRESETS: Record<string, string[]> = {
+  sun: ['weixin', 'zhihu', 'xiaohongshu', 'x', 'toutiao'],
+  longform: ['weixin', 'zhihu', 'toutiao'],
+  social: ['xiaohongshu', 'x', 'weibo'],
+  tech: ['weixin', 'zhihu', 'juejin', 'csdn'],
+}
+
+function formatPresetList(): string {
+  return Object.entries(PLATFORM_PRESETS)
+    .map(([name, platforms]) => `${name}=${platforms.join(',')}`)
+    .join(' | ')
+}
+
+function resolvePlatforms(options: { platforms?: string; preset?: string }): string[] {
+  if (options.preset) {
+    const preset = PLATFORM_PRESETS[options.preset]
+    if (!preset) {
+      console.error(chalk.red(`未知平台预设: ${options.preset}`))
+      console.log(chalk.gray(`可用预设: ${formatPresetList()}`))
+      process.exit(1)
+    }
+    return preset
+  }
+
+  return (options.platforms || 'zhihu,juejin')
+    .split(',')
+    .map((p: string) => p.trim().toLowerCase())
+    .filter(Boolean)
+}
+
 // 默认超时时间
 let connectionTimeout = 30000
 
@@ -519,6 +549,433 @@ function markdownToHtml(markdown: string): string {
   return html
 }
 
+// ============ Sun draft-first 发布包 ============
+
+type PublishPolicy = 'manual-final-click' | 'authorized-direct-publish'
+
+interface DraftFile {
+  kind: 'source' | 'platform' | 'automation' | 'metadata'
+  platform?: string
+  path: string
+  note?: string
+}
+
+interface DraftManifest {
+  version: 1
+  generatedAt: string
+  source: string
+  title: string
+  platforms: string[]
+  publishPolicy: PublishPolicy
+  files: DraftFile[]
+  xhs?: {
+    title: string
+    bodyChars: number
+    imageCount: number
+    images: string[]
+    automation: string
+  }
+}
+
+function slugify(input: string): string {
+  const cleaned = input
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+  return cleaned || 'article'
+}
+
+function ensureDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true })
+}
+
+function writeTextFile(filePath: string, content: string): void {
+  ensureDir(path.dirname(filePath))
+  fs.writeFileSync(filePath, content, 'utf-8')
+}
+
+function stripMarkdown(markdown: string): string {
+  return markdown
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[#>*_`~\-]+/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function makeXhsTitle(title: string): string {
+  const normalized = title.replace(/\s+/g, ' ').trim()
+  return Array.from(normalized).slice(0, 20).join('')
+}
+
+function makeXhsBody(title: string, markdown: string, maxChars = 950): string {
+  const plain = stripMarkdown(markdown)
+  const tags = '#AI设计 #UI设计 #UX设计 #产品设计 #AI工具 #Cursor #Codex #设计系统 #前端开发'
+  const intro = plain || title
+  const budget = Math.max(80, maxChars - Array.from(tags).length - 2)
+  const clipped = Array.from(intro).slice(0, budget).join('')
+  return `${clipped}${Array.from(intro).length > budget ? '...' : ''}\n\n${tags}`
+}
+
+function resolveMaybeListFile(value: string | undefined, cwd: string): string[] {
+  if (!value) return []
+  const candidate = path.resolve(cwd, value)
+  if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+    return fs.readFileSync(candidate, 'utf-8')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((item) => path.resolve(path.dirname(candidate), item))
+  }
+
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => path.resolve(cwd, item))
+}
+
+function collectLocalImagePaths(content: string, basePath: string): string[] {
+  return findLocalImages(content, basePath)
+    .map((img) => img.absolutePath)
+    .filter((imgPath) => fs.existsSync(imgPath))
+}
+
+function writeJsonFile(filePath: string, data: unknown): void {
+  writeTextFile(filePath, `${JSON.stringify(data, null, 2)}\n`)
+}
+
+function createXhsPlaywrightScript(): string {
+  return `#!/usr/bin/env node
+import fs from 'node:fs'
+import path from 'node:path'
+
+const { chromium } = await import('playwright-core')
+
+const manifestPath = process.argv[2] || path.resolve('manifest.json')
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'))
+if (!manifest.xhs) throw new Error('manifest.xhs is missing')
+
+const cdpUrl = process.env.CHROME_CDP_URL || 'http://127.0.0.1:9222'
+const browser = await chromium.connectOverCDP(cdpUrl)
+const context = browser.contexts()[0] || await browser.newContext()
+let page = context.pages().find((p) => p.url().includes('creator.xiaohongshu.com'))
+if (!page) page = await context.newPage()
+
+await page.goto('https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image', {
+  waitUntil: 'domcontentloaded',
+})
+
+const imageInput = page.locator('input[type="file"]').first()
+await imageInput.waitFor({ state: 'attached', timeout: 30000 })
+if (manifest.xhs.images.length > 0) {
+  await imageInput.setInputFiles(manifest.xhs.images)
+}
+
+await page.getByPlaceholder('填写标题会有更多赞哦').fill(manifest.xhs.title)
+
+const body = fs.readFileSync(path.join(path.dirname(manifestPath), 'platforms/xiaohongshu/body.txt'), 'utf-8')
+const bodyTargets = page.locator('textarea, [contenteditable="true"]')
+const bodyCount = await bodyTargets.count()
+if (bodyCount === 0) throw new Error('Could not find Xiaohongshu body editor')
+await bodyTargets.nth(bodyCount - 1).fill(body)
+
+console.log('Xiaohongshu draft is filled. Final publish was not clicked.')
+await browser.disconnect()
+`
+}
+
+function relativeFrom(baseDir: string, filePath: string): string {
+  return path.relative(baseDir, filePath) || path.basename(filePath)
+}
+
+function createDraftPackage(filePath: string, options: {
+  title?: string
+  platforms?: string
+  preset?: string
+  out?: string
+  xhsImages?: string
+  publishPolicy?: PublishPolicy
+}): DraftManifest {
+  const parsed = parseFileContent(filePath)
+  const title = options.title || parsed.title
+  if (!title) {
+    throw new Error('无法从文件提取标题，请使用 --title 指定')
+  }
+
+  const platforms = resolvePlatforms({
+    platforms: options.platforms || 'weixin,zhihu,xiaohongshu,x,toutiao',
+    preset: options.preset,
+  })
+  const sourceDir = path.dirname(filePath)
+  const slug = slugify(title)
+  const outDir = path.resolve(options.out || path.join(process.cwd(), 'drafts', slug))
+  const platformDir = path.join(outDir, 'platforms')
+  const automationDir = path.join(outDir, 'automation')
+  const files: DraftFile[] = []
+
+  ensureDir(outDir)
+  ensureDir(platformDir)
+
+  const sourceCopy = path.join(outDir, `source${parsed.format === 'html' ? '.html' : '.md'}`)
+  writeTextFile(sourceCopy, fs.readFileSync(filePath, 'utf-8'))
+  files.push({ kind: 'source', path: relativeFrom(outDir, sourceCopy), note: '原始输入副本' })
+
+  const html = parsed.format === 'html' ? parsed.content : markdownToHtml(parsed.content)
+  const markdown = parsed.format === 'markdown' ? parsed.content : stripMarkdown(parsed.content)
+  const weixinHtml = convertImagesToDataUri(html, sourceDir).content
+
+  if (platforms.includes('weixin')) {
+    const weixinPath = path.join(platformDir, 'weixin.html')
+    writeTextFile(weixinPath, weixinHtml)
+    files.push({ kind: 'platform', platform: 'weixin', path: relativeFrom(outDir, weixinPath), note: '公众号富文本 HTML，可复制到编辑器或交给后续适配器' })
+  }
+
+  if (platforms.includes('zhihu')) {
+    const zhihuPath = path.join(platformDir, 'zhihu.md')
+    writeTextFile(zhihuPath, `# ${title}\n\n${markdown}\n`)
+    files.push({ kind: 'platform', platform: 'zhihu', path: relativeFrom(outDir, zhihuPath), note: '知乎草稿 Markdown' })
+  }
+
+  if (platforms.includes('toutiao')) {
+    const toutiaoPath = path.join(platformDir, 'toutiao.md')
+    writeTextFile(toutiaoPath, `# ${title}\n\n${markdown}\n`)
+    files.push({ kind: 'platform', platform: 'toutiao', path: relativeFrom(outDir, toutiaoPath), note: '今日头条草稿 Markdown' })
+  }
+
+  if (platforms.includes('x')) {
+    const xDir = path.join(platformDir, 'x')
+    const xText = Array.from(stripMarkdown(markdown)).slice(0, 260).join('')
+    writeTextFile(path.join(xDir, 'post.txt'), `${xText}${Array.from(stripMarkdown(markdown)).length > 260 ? '…' : ''}\n`)
+    files.push({ kind: 'platform', platform: 'x', path: relativeFrom(outDir, path.join(xDir, 'post.txt')), note: 'X/Twitter 首条草稿，长文需后续 thread 拆分' })
+  }
+
+  let xhsManifest: DraftManifest['xhs']
+  if (platforms.includes('xiaohongshu')) {
+    const xhsDir = path.join(platformDir, 'xiaohongshu')
+    const xhsTitle = makeXhsTitle(title)
+    const xhsBody = makeXhsBody(title, markdown)
+    const explicitImages = resolveMaybeListFile(options.xhsImages, process.cwd())
+    const xhsImages = explicitImages.length > 0 ? explicitImages : collectLocalImagePaths(parsed.content, sourceDir)
+    const missingImages = xhsImages.filter((img) => !fs.existsSync(img))
+    if (missingImages.length > 0) {
+      throw new Error(`小红书图片不存在: ${missingImages.join(', ')}`)
+    }
+
+    const titlePath = path.join(xhsDir, 'title.txt')
+    const bodyPath = path.join(xhsDir, 'body.txt')
+    const imagesPath = path.join(xhsDir, 'upload-files.txt')
+    const scriptPath = path.join(automationDir, 'xhs-dom-upload.playwright.mjs')
+    writeTextFile(titlePath, `${xhsTitle}\n`)
+    writeTextFile(bodyPath, xhsBody)
+    writeTextFile(imagesPath, `${xhsImages.join('\n')}\n`)
+    writeTextFile(scriptPath, createXhsPlaywrightScript())
+    fs.chmodSync(scriptPath, 0o755)
+
+    files.push({ kind: 'platform', platform: 'xiaohongshu', path: relativeFrom(outDir, titlePath), note: '小红书标题，20 字以内' })
+    files.push({ kind: 'platform', platform: 'xiaohongshu', path: relativeFrom(outDir, bodyPath), note: '小红书正文，1000 字以内' })
+    files.push({ kind: 'platform', platform: 'xiaohongshu', path: relativeFrom(outDir, imagesPath), note: '小红书待上传图片绝对路径列表' })
+    files.push({ kind: 'automation', platform: 'xiaohongshu', path: relativeFrom(outDir, scriptPath), note: 'DOM/file-input 上传脚本；需要 CHROME_CDP_URL 指向已登录 Chrome 调试端口；不会点击发布' })
+
+    xhsManifest = {
+      title: xhsTitle,
+      bodyChars: Array.from(xhsBody).length,
+      imageCount: xhsImages.length,
+      images: xhsImages,
+      automation: relativeFrom(outDir, scriptPath),
+    }
+  }
+
+  const readmePath = path.join(outDir, 'README.md')
+  writeTextFile(readmePath, `# ${title}
+
+这是 WechatSync 的 draft-first 发布包。它只生成平台草稿素材和稳定自动化入口，不执行最终发布。
+
+## 文件
+
+${files.map((file) => `- \`${file.path}\`${file.platform ? ` (${file.platform})` : ''}${file.note ? ` - ${file.note}` : ''}`).join('\n')}
+
+## 小红书自动化
+
+如果需要自动填入小红书，请先用已登录 Chrome 启动调试端口，然后执行：
+
+\`\`\`bash
+wechatsync chrome-cdp start --open https://creator.xiaohongshu.com
+wechatsync draft-run manifest.json --platform xiaohongshu
+\`\`\`
+
+这条路径使用 DOM selector 和 \`input[type=file]\`，不是屏幕坐标点击。默认只填图、标题、正文，不会点击最终发布。
+`)
+  files.push({ kind: 'metadata', path: relativeFrom(outDir, readmePath), note: '草稿包说明' })
+
+  const manifest: DraftManifest = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    source: filePath,
+    title,
+    platforms,
+    publishPolicy: options.publishPolicy || 'manual-final-click',
+    files,
+    xhs: xhsManifest,
+  }
+
+  const manifestPath = path.join(outDir, 'manifest.json')
+  writeJsonFile(manifestPath, manifest)
+  manifest.files.push({ kind: 'metadata', path: relativeFrom(outDir, manifestPath), note: '发布器 manifest' })
+  writeJsonFile(manifestPath, manifest)
+
+  return manifest
+}
+
+// ============ Chrome CDP / draft runner ============
+
+interface ChromeCdpOptions {
+  port?: string
+  cdpUrl?: string
+  userDataDir?: string
+  chromePath?: string
+  waitMs?: string
+  open?: string
+  headless?: boolean
+}
+
+function getCdpUrl(options: ChromeCdpOptions): string {
+  return options.cdpUrl || process.env.CHROME_CDP_URL || `http://127.0.0.1:${options.port || '9222'}`
+}
+
+function getCdpPort(options: ChromeCdpOptions): number {
+  try {
+    return Number(new URL(getCdpUrl(options)).port || '9222')
+  } catch {
+    return Number(options.port || '9222')
+  }
+}
+
+async function isCdpAvailable(cdpUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${cdpUrl.replace(/\/$/, '')}/json/version`, {
+      signal: AbortSignal.timeout(2000),
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+async function waitForCdp(cdpUrl: string, waitMs: number): Promise<boolean> {
+  const deadline = Date.now() + waitMs
+  while (Date.now() < deadline) {
+    if (await isCdpAvailable(cdpUrl)) return true
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  return false
+}
+
+function resolveChromeExecutable(explicit?: string): string {
+  const candidates = [
+    explicit,
+    process.env.CHROME_PATH,
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ].filter(Boolean) as string[]
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+
+  throw new Error('找不到 Chrome，请用 --chrome-path 或 CHROME_PATH 指定')
+}
+
+async function startChromeCdp(options: ChromeCdpOptions): Promise<string> {
+  const { spawn } = await import('child_process')
+  const cdpUrl = getCdpUrl(options)
+  if (await isCdpAvailable(cdpUrl)) {
+    return cdpUrl
+  }
+
+  const port = getCdpPort(options)
+  const chromePath = resolveChromeExecutable(options.chromePath)
+  const userDataDir = path.resolve(options.userDataDir || path.join(process.env.HOME || process.cwd(), '.wechatsync-chrome'))
+  ensureDir(userDataDir)
+
+  const args = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ]
+  if (options.headless) {
+    args.push('--headless=new', '--disable-gpu')
+  }
+  args.push(options.open || 'about:blank')
+
+  const child = spawn(chromePath, args, {
+    detached: true,
+    stdio: 'ignore',
+  })
+  child.unref()
+
+  const waitMs = Number(options.waitMs || '15000')
+  if (!(await waitForCdp(cdpUrl, waitMs))) {
+    throw new Error(`Chrome 已启动，但 ${cdpUrl} 在 ${waitMs}ms 内不可用`)
+  }
+
+  return cdpUrl
+}
+
+function readDraftManifest(manifestPath: string): DraftManifest {
+  const resolved = path.resolve(manifestPath)
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`manifest 不存在: ${resolved}`)
+  }
+  const manifest = JSON.parse(fs.readFileSync(resolved, 'utf-8')) as DraftManifest
+  if (manifest.version !== 1 || !manifest.title || !Array.isArray(manifest.platforms)) {
+    throw new Error(`manifest 格式不正确: ${resolved}`)
+  }
+  return manifest
+}
+
+async function runXhsDraftAutomation(manifestPath: string, cdpUrl: string): Promise<void> {
+  const { chromium } = await import('playwright-core')
+  const manifest = readDraftManifest(manifestPath)
+  if (!manifest.xhs) throw new Error('manifest.xhs is missing')
+
+  const browser = await chromium.connectOverCDP(cdpUrl)
+  const context = browser.contexts()[0] || await browser.newContext()
+  let page = context.pages().find((p) => p.url().includes('creator.xiaohongshu.com'))
+  if (!page) page = await context.newPage()
+
+  await page.goto('https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image', {
+    waitUntil: 'domcontentloaded',
+  })
+
+  const imageInput = page.locator('input[type="file"]').first()
+  await imageInput.waitFor({ state: 'attached', timeout: 30000 })
+  if (manifest.xhs.images.length > 0) {
+    await imageInput.setInputFiles(manifest.xhs.images)
+  }
+
+  await page.getByPlaceholder('填写标题会有更多赞哦').fill(manifest.xhs.title)
+
+  const bodyPath = path.join(path.dirname(manifestPath), 'platforms/xiaohongshu/body.txt')
+  const body = fs.readFileSync(bodyPath, 'utf-8')
+  const bodyTargets = page.locator('textarea, [contenteditable="true"]')
+  const bodyCount = await bodyTargets.count()
+  if (bodyCount === 0) throw new Error('Could not find Xiaohongshu body editor')
+  await bodyTargets.nth(bodyCount - 1).fill(body)
+
+  await (browser as unknown as { disconnect: () => Promise<void> }).disconnect()
+}
+
 // ============ Bridge 连接 ============
 
 /**
@@ -630,6 +1087,7 @@ program
   .command('sync <file>')
   .description('同步 Markdown/HTML 文件到平台（HTML 文件可保留自定义排版样式）')
   .option('-p, --platforms <platforms>', '目标平台，逗号分隔', 'zhihu,juejin')
+  .option('--preset <preset>', `平台预设：${formatPresetList()}`)
   .option('-t, --title <title>', '文章标题（默认从文件提取）')
   .option('--cover <url>', '封面图 URL 或本地路径')
   .option('--dry-run', '仅显示将要执行的操作，不实际同步')
@@ -675,7 +1133,7 @@ program
       }
     }
 
-    const platforms = options.platforms.split(',').map((p: string) => p.trim().toLowerCase())
+    const platforms = resolvePlatforms(options)
 
     // 准备内容
     const markdown = parsed.format === 'markdown' ? parsed.content : undefined
@@ -687,6 +1145,9 @@ program
     console.log(`  标题: ${chalk.cyan(title)}`)
     console.log(`  格式: ${chalk.cyan(parsed.format)}${parsed.format === 'html' ? chalk.green(' (保留原始排版)') : ''}`)
     console.log(`  平台: ${chalk.cyan(platforms.join(', '))}`)
+    if (options.preset) {
+      console.log(`  预设: ${chalk.cyan(options.preset)}`)
+    }
     console.log(`  内容: ${chalk.gray(parsed.content.length + ' 字符')}`)
     if (cover) {
       console.log(`  封面: ${chalk.cyan(cover.startsWith('data:') ? '(本地图片)' : cover)}`)
@@ -789,6 +1250,191 @@ program
       bridge.stop()
       process.exit(0)
     }
+  })
+
+// ============ draft 命令 ============
+
+program
+  .command('draft <file>')
+  .description('生成 draft-first 多平台发布包（不连接扩展，不点击最终发布）')
+  .option('-p, --platforms <platforms>', '目标平台，逗号分隔', 'weixin,zhihu,xiaohongshu,x,toutiao')
+  .option('--preset <preset>', `平台预设：${formatPresetList()}`)
+  .option('-t, --title <title>', '文章标题（默认从文件提取）')
+  .option('-o, --out <dir>', '输出目录（默认 drafts/<title-slug>）')
+  .option('--xhs-images <pathsOrFile>', '小红书图片：逗号分隔路径，或包含图片路径的文本文件')
+  .option('--publish-policy <policy>', '发布策略：manual-final-click 或 authorized-direct-publish', 'manual-final-click')
+  .action((file: string, options) => {
+    const filePath = path.resolve(file)
+    if (!fs.existsSync(filePath)) {
+      console.error(chalk.red(`文件不存在: ${filePath}`))
+      process.exit(1)
+    }
+
+    if (!['manual-final-click', 'authorized-direct-publish'].includes(options.publishPolicy)) {
+      console.error(chalk.red(`未知发布策略: ${options.publishPolicy}`))
+      console.log(chalk.gray('可用策略: manual-final-click, authorized-direct-publish'))
+      process.exit(1)
+    }
+
+    try {
+      const manifest = createDraftPackage(filePath, {
+        title: options.title,
+        platforms: options.platforms,
+        preset: options.preset,
+        out: options.out,
+        xhsImages: options.xhsImages,
+        publishPolicy: options.publishPolicy,
+      })
+      const manifestFile = path.resolve(options.out || path.join(process.cwd(), 'drafts', slugify(manifest.title)), 'manifest.json')
+
+      console.log()
+      console.log(chalk.bold('发布草稿包已生成:'))
+      console.log(`  标题: ${chalk.cyan(manifest.title)}`)
+      console.log(`  平台: ${chalk.cyan(manifest.platforms.join(', '))}`)
+      console.log(`  策略: ${chalk.cyan(manifest.publishPolicy)}`)
+      console.log(`  Manifest: ${chalk.cyan(manifestFile)}`)
+      if (manifest.xhs) {
+        console.log(`  小红书: ${chalk.cyan(`${manifest.xhs.imageCount} 张图, ${manifest.xhs.bodyChars}/1000 字`)}`)
+      }
+      console.log(chalk.gray(`  输出目录: ${path.dirname(manifestFile)}`))
+      console.log()
+    } catch (error) {
+      console.error(chalk.red((error as Error).message))
+      process.exit(1)
+    }
+  })
+
+// ============ chrome-cdp 命令 ============
+
+program
+  .command('chrome-cdp [action]')
+  .description('启动或检查一个带 remote-debugging-port 的 Chrome（供 draft-run 使用）')
+  .option('--cdp-url <url>', 'Chrome DevTools Protocol 地址（默认 http://127.0.0.1:9222）')
+  .option('--port <port>', 'Chrome 调试端口', '9222')
+  .option('--user-data-dir <dir>', 'Chrome 独立用户数据目录（默认 ~/.wechatsync-chrome）')
+  .option('--chrome-path <path>', 'Chrome 可执行文件路径')
+  .option('--open <url>', '启动后打开的页面', 'about:blank')
+  .option('--headless', '无头启动 Chrome（主要用于 CI/smoke）')
+  .option('--wait-ms <ms>', '等待 CDP 可用的时间', '15000')
+  .action(async (action: string | undefined, options) => {
+    const nextAction = action || 'check'
+    const cdpUrl = getCdpUrl(options)
+
+    try {
+      if (nextAction === 'check') {
+        const available = await isCdpAvailable(cdpUrl)
+        console.log()
+        if (available) {
+          console.log(chalk.green(`✓ Chrome CDP 可用: ${cdpUrl}`))
+        } else {
+          console.log(chalk.red(`✗ Chrome CDP 不可用: ${cdpUrl}`))
+          console.log(chalk.gray(`  启动: wechatsync chrome-cdp start --port ${getCdpPort(options)}`))
+          process.exitCode = 1
+        }
+        console.log()
+        return
+      }
+
+      if (nextAction !== 'start') {
+        console.error(chalk.red(`未知 action: ${nextAction}`))
+        console.log(chalk.gray('可用 action: check, start'))
+        process.exit(1)
+      }
+
+      const startedUrl = await startChromeCdp(options)
+      console.log()
+      console.log(chalk.green(`✓ Chrome CDP 已就绪: ${startedUrl}`))
+      console.log(chalk.gray(`  export CHROME_CDP_URL=${startedUrl}`))
+      console.log()
+    } catch (error) {
+      console.error(chalk.red((error as Error).message))
+      process.exit(1)
+    }
+  })
+
+// ============ draft-run 命令 ============
+
+program
+  .command('draft-run <manifest>')
+  .description('消费 draft manifest，并用 DOM/file-input 自动填平台草稿（默认不点击最终发布）')
+  .option('-p, --platform <platform>', '要运行的平台适配器', 'xiaohongshu')
+  .option('--cdp-url <url>', 'Chrome DevTools Protocol 地址（默认 http://127.0.0.1:9222）')
+  .option('--port <port>', 'Chrome 调试端口', '9222')
+  .option('--start-chrome', '如果 CDP 不可用，则启动隔离 Chrome profile')
+  .option('--user-data-dir <dir>', 'Chrome 独立用户数据目录（默认 ~/.wechatsync-chrome）')
+  .option('--chrome-path <path>', 'Chrome 可执行文件路径')
+  .option('--headless', '无头启动 Chrome（主要用于 CI/smoke）')
+  .option('--wait-ms <ms>', '等待 CDP 可用的时间', '15000')
+  .option('--dry-run', '只检查 manifest、CDP 和适配器脚本，不真正填草稿')
+  .action(async (manifestArg: string, options) => {
+    try {
+      const manifestPath = path.resolve(manifestArg)
+      const manifest = readDraftManifest(manifestPath)
+      const manifestDir = path.dirname(manifestPath)
+      const platform = String(options.platform || 'xiaohongshu').toLowerCase()
+
+      if (platform !== 'xiaohongshu') {
+        throw new Error(`暂不支持 draft-run 平台: ${platform}`)
+      }
+      if (!manifest.xhs) {
+        throw new Error('manifest 中没有 xiaohongshu 草稿配置')
+      }
+
+      const scriptPath = path.resolve(manifestDir, manifest.xhs.automation)
+      if (!fs.existsSync(scriptPath)) {
+        throw new Error(`小红书自动化脚本不存在: ${scriptPath}`)
+      }
+
+      let cdpUrl = getCdpUrl(options)
+      if (options.startChrome) {
+        cdpUrl = await startChromeCdp({
+          ...options,
+          open: 'https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image',
+        })
+      }
+
+      const cdpReady = await isCdpAvailable(cdpUrl)
+      if (!cdpReady) {
+        throw new Error(`Chrome CDP 不可用: ${cdpUrl}。先运行 wechatsync chrome-cdp start，或加 --start-chrome`)
+      }
+
+      console.log()
+      console.log(chalk.bold('draft-run 检查:'))
+      console.log(`  标题: ${chalk.cyan(manifest.title)}`)
+      console.log(`  平台: ${chalk.cyan(platform)}`)
+      console.log(`  CDP: ${chalk.cyan(cdpUrl)}`)
+      console.log(`  图片: ${chalk.cyan(`${manifest.xhs.imageCount} 张`)}`)
+      console.log(`  正文: ${chalk.cyan(`${manifest.xhs.bodyChars}/1000 字`)}`)
+      console.log(`  策略: ${chalk.cyan(manifest.publishPolicy)}`)
+
+      if (options.dryRun) {
+        console.log(chalk.yellow('  dry-run: 未填入浏览器草稿'))
+        console.log()
+        return
+      }
+
+      await runXhsDraftAutomation(manifestPath, cdpUrl)
+      console.log(chalk.green('Xiaohongshu draft is filled. Final publish was not clicked.'))
+    } catch (error) {
+      console.error(chalk.red((error as Error).message))
+      process.exit(1)
+    }
+  })
+
+// ============ presets 命令 ============
+
+program
+  .command('presets')
+  .description('列出内置平台预设')
+  .action(() => {
+    console.log()
+    console.log(chalk.bold('平台预设:'))
+    console.log()
+    for (const [name, platforms] of Object.entries(PLATFORM_PRESETS)) {
+      console.log(`  ${chalk.cyan(name.padEnd(8))} ${platforms.join(', ')}`)
+    }
+    console.log()
+    console.log(chalk.gray('示例: wechatsync sync article.md --preset sun'))
   })
 
 // ============ platforms 命令 ============
@@ -977,6 +1623,8 @@ if (process.argv.length <= 2) {
   console.log()
   console.log(chalk.bold('快速开始:'))
   console.log(`  ${chalk.cyan('wechatsync sync article.md')}        同步 Markdown 文件`)
+  console.log(`  ${chalk.cyan('wechatsync sync article.md --preset sun')}  同步到 Sun 常用平台`)
+  console.log(`  ${chalk.cyan('wechatsync presets')}         查看平台预设`)
   console.log(`  ${chalk.cyan('wechatsync sync article.html')}      同步 HTML 文件 (保留自定义排版)`)
   console.log(`  ${chalk.cyan('wechatsync extract -o out.md')}      从浏览器提取文章`)
   console.log()
